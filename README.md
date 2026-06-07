@@ -1,7 +1,5 @@
 # CertiFaker 3000
 
-An enterprise-grade CLI tool for automating OpenSSL certificate signing request (CSR) generation against internal certificate authorities. Handles key generation, CSR creation, placeholder file scaffolding, renewal archiving, and batch processing — all driven by per-directory `openssl.cnf` files.
-
 ---
 
 ## Requirements
