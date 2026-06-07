@@ -1,0 +1,27 @@
+# Cert files
+*.key
+*.csr
+*.pem
+*.pfx
+*.p12
+*.txt
+*.cer
+*.crt
+
+# Tool artifacts
+cert_gen.log
+batch.txt
+
+# Backup folders
+*_backup_*/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.spec
+dist/
+build/
