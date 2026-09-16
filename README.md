@@ -30,10 +30,15 @@ Each certificate lives in its own directory containing an `openssl.cnf`. The scr
 |---|---|
 | `{CN}.key` | AES-256 encrypted RSA private key |
 | `{CN}.csr` | Certificate signing request — submit to cert team |
-| `{CN}-root.txt` | Empty placeholder for root certificate |
-| `{CN}-intermediate.txt` | Empty placeholder for intermediate certificate |
-| `{CN}.txt` | Empty placeholder for signed certificate |
+| `{CN}-root.crt` | Empty placeholder for root certificate |
+| `{CN}-intermediate.crt` | Empty placeholder for intermediate certificate |
+| `{CN}.crt` | Empty placeholder for signed certificate |
 | `{CN}.password.txt` | Auto-generated password (only if auto-gen chosen) |
+| `{CN}.pfx` | PKCS#12 bundle for Windows install — created later by `--pfx` |
+
+> The `.crt` placeholders are plain PEM text. On Windows, double-clicking one
+> opens the Certificate viewer rather than a text editor (and errors on an empty
+> file), so paste into them with right-click → **Open with** → Notepad.
 
 ---
 
@@ -83,6 +88,8 @@ python gen_cert.py --paths "C:\certs\AppServer01" "C:\certs\WebGateway" --keysiz
 | `--input FILE` | Batch input file (one path per line) |
 | `--keysize {2048,4096}` | RSA key size — applies to all certs in the run (default: 2048) |
 | `--autopass` | Auto-generate a unique secure password for each cert |
+| `--pfx` | Export `{CN}.pfx` from the populated cert files (second stage — see below) |
+| `--no-chain` | With `--pfx`, export the leaf certificate only |
 | `--force` | Overwrite existing files without prompting |
 | `--dry-run` | Preview all actions without writing any files |
 
@@ -176,6 +183,88 @@ python gen_cert.py --input batch.txt
 When running multiple certs, the script offers to apply the same key size and password settings across all of them. Each cert still prompts individually for New or Renewal.
 
 If any paths fail validation (missing directory, missing `openssl.cnf`, unreadable CN), the script reports them and asks whether to continue with the valid paths before any cert work begins.
+
+---
+
+## Stage 2 — Building the .pfx
+
+The tool runs in two stages. Stage 1 (above) produces the CSR and the empty
+`.crt` placeholders. Once the ServiceNow request comes back:
+
+1. Paste the returned PEM blocks into the placeholders in that cert directory:
+
+   | File | Paste |
+   |---|---|
+   | `{CN}.crt` | the signed server certificate |
+   | `{CN}-intermediate.crt` | the issuing/intermediate CA certificate |
+   | `{CN}-root.crt` | the root CA certificate |
+
+2. Run the export against the same directories:
+
+```
+python gen_cert.py --paths C:\certs\AppServer01 --pfx
+```
+
+```
+  Directory : C:\certs\AppServer01
+  CN        : appserver01.corp.example.com
+
+  Certificate : appserver01.corp.example.com.crt
+  Chain       : appserver01.corp.example.com-intermediate.crt
+  Chain       : appserver01.corp.example.com-root.crt
+  Password read from appserver01.corp.example.com.password.txt
+
+  Verifying key and certificate match...
+    OK — certificate matches the private key.
+  Exporting PFX...
+
+  [PFX Verification]  appserver01.corp.example.com.pfx
+    subject=C=US, ST=New York, O=Acme Corporation, CN=appserver01.corp.example.com
+    subject=C=US, O=Acme Corporation, CN=Acme Issuing CA
+    subject=C=US, O=Acme Corporation, CN=Acme Root CA
+
+  ============================================================
+  PFX READY — appserver01.corp.example.com.pfx
+  Import password: same as the certificate password
+  ============================================================
+```
+
+`--pfx` accepts the same `--paths`, `--input`, `--force` and `--dry-run` flags as
+stage 1, so a whole batch can be exported in one run:
+
+```
+python gen_cert.py --input batch.txt --pfx
+```
+
+**The PFX import password is the certificate password** — read from
+`{CN}.password.txt` when it exists, otherwise prompted for. No second secret.
+
+### Chain handling
+
+The root and intermediate are bundled into the PFX via `-certfile`, so IIS
+presents the full chain to clients. If either file is empty the export still
+succeeds and warns that the chain is incomplete. Pass `--no-chain` to export the
+leaf certificate alone.
+
+### Checks performed before export
+
+| Check | Failure |
+|---|---|
+| `{CN}.key` exists | Export aborts |
+| `{CN}.crt` exists and is non-empty | Aborts, telling you to paste the cert |
+| Each file contains a `BEGIN CERTIFICATE` block | Aborts, naming the file |
+| Certificate and private key are a matching pair | Aborts — catches a cert pasted into the wrong directory |
+| Written PFX reads back with at least one certificate | Aborts |
+
+Certs issued before the `.crt` rename are still supported: if `{CN}.crt` is
+absent the export falls back to `{CN}.txt`. Nothing needs renaming by hand.
+
+### OpenSSL version note
+
+The export uses `-legacy`, which exists only in OpenSSL 3.x and selects the
+older algorithms Windows expects. On OpenSSL 1.x the flag is rejected — the tool
+detects this, reports it, and retries without it. Those algorithms are already
+the default on 1.x, so the resulting PFX is the same.
 
 ---
 

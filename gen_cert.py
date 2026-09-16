@@ -295,9 +295,9 @@ def process_cert(
     # File paths
     key_file  = cert_path / f"{cn}.key"
     csr_file  = cert_path / f"{cn}.csr"
-    root_file = cert_path / f"{cn}-root.txt"
-    inter_file = cert_path / f"{cn}-intermediate.txt"
-    cert_file = cert_path / f"{cn}.txt"
+    root_file = cert_path / f"{cn}-root.crt"
+    inter_file = cert_path / f"{cn}-intermediate.crt"
+    cert_file = cert_path / f"{cn}.crt"
     pass_file = cert_path / f"{cn}.password.txt"
 
     output_files = [key_file, csr_file, root_file, inter_file, cert_file]
@@ -419,6 +419,209 @@ def process_cert(
     print("=" * 60)
 
 
+# ── PFX export ─────────────────────────────────────────────────────────────────
+
+# .crt is what the script writes now; .txt is still accepted so certs issued
+# before the rename can be exported without renaming anything by hand.
+CERT_SUFFIXES = (".crt", ".txt")
+PEM_CERT_MARKER = "-----BEGIN CERTIFICATE-----"
+
+
+def find_cert_file(cert_path: Path, stem: str) -> Path | None:
+    """First populated cert file matching stem, preferring .crt over .txt."""
+    for suffix in CERT_SUFFIXES:
+        f = cert_path / f"{stem}{suffix}"
+        if f.exists() and f.stat().st_size > 0:
+            return f
+    return None
+
+
+def read_pem_certs(path: Path) -> str:
+    """Read a PEM file, erroring if it holds no certificate block."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if PEM_CERT_MARKER not in text:
+        raise RuntimeError(
+            f"{path.name} contains no '{PEM_CERT_MARKER}' block. "
+            "Paste the PEM text from the ServiceNow response into it."
+        )
+    return text if text.endswith("\n") else text + "\n"
+
+
+def key_password_for(cert_path: Path, cn: str) -> str:
+    """Password protecting {cn}.key — from the saved file, else prompted."""
+    pass_file = cert_path / f"{cn}.password.txt"
+    if pass_file.exists() and pass_file.stat().st_size > 0:
+        print(f"  Password read from {pass_file.name}")
+        return pass_file.read_text(encoding="utf-8").strip()
+    return getpass.getpass(f"  Enter the password for {cn}.key: ")
+
+
+def assert_key_matches_cert(key_file: Path, cert_file: Path, env: dict) -> None:
+    """Refuse to build a PFX whose key and certificate are not a pair."""
+    key_mod = run_openssl(
+        ["rsa", "-noout", "-modulus", "-in", str(key_file), "-passin", "env:OPENSSL_PASS"],
+        env=env, capture=True,
+    ).stdout.strip()
+    cert_mod = run_openssl(
+        ["x509", "-noout", "-modulus", "-in", str(cert_file)],
+        env=env, capture=True,
+    ).stdout.strip()
+    if key_mod != cert_mod:
+        raise RuntimeError(
+            f"{cert_file.name} was not issued for {key_file.name} — their public keys differ. "
+            "Check that the pasted certificate came back from the CSR in this directory."
+        )
+
+
+def run_pkcs12_export(args: list[str], env: dict) -> bool:
+    """Run `pkcs12 -export`, retrying without -legacy where it is unsupported.
+
+    -legacy exists only in OpenSSL 3.x. On 1.x the flag is rejected outright,
+    and the legacy algorithms it selects are already the default there, so
+    dropping it on that path produces the same PFX.
+    """
+    try:
+        run_openssl(["pkcs12", "-export", "-legacy", *args], env=env, capture=True)
+        return True
+    except RuntimeError as exc:
+        if "legacy" not in str(exc).lower():
+            raise
+        print("  [NOTE] This OpenSSL build rejects -legacy; exporting without it.")
+        run_openssl(["pkcs12", "-export", *args], env=env, capture=True)
+        return False
+
+
+def export_pfx(cert_path: Path, force: bool, dry_run: bool, include_chain: bool) -> None:
+    cnf = cert_path / "openssl.cnf"
+    cn = parse_cn(cnf)
+
+    print(f"\n{'─' * 60}")
+    print(f"  Directory : {cert_path}")
+    print(f"  CN        : {cn}")
+    print(f"{'─' * 60}")
+
+    key_file = cert_path / f"{cn}.key"
+    pfx_file = cert_path / f"{cn}.pfx"
+
+    if not key_file.exists():
+        raise RuntimeError(f"Private key not found: {key_file.name}")
+
+    leaf_file = find_cert_file(cert_path, cn)
+    if leaf_file is None:
+        raise RuntimeError(
+            f"Signed certificate {cn}.crt is missing or still empty. "
+            "Paste the certificate from the ServiceNow response before exporting."
+        )
+
+    root_file  = find_cert_file(cert_path, f"{cn}-root")
+    inter_file = find_cert_file(cert_path, f"{cn}-intermediate")
+
+    print(f"  Certificate : {leaf_file.name}")
+    chain_files: list[Path] = []
+    if include_chain:
+        # Intermediate first, then root — the order Windows expects to walk.
+        chain_files = [f for f in (inter_file, root_file) if f is not None]
+        for f in chain_files:
+            print(f"  Chain       : {f.name}")
+        missing = [
+            label for label, f in (("intermediate", inter_file), ("root", root_file)) if f is None
+        ]
+        if missing:
+            print(f"  [WARNING] No {' or '.join(missing)} certificate found — "
+                  "the PFX will not carry a complete chain.")
+    else:
+        print("  Chain       : skipped (--no-chain)")
+
+    if pfx_file.exists() and not force:
+        print(f"\n  [WARNING] {pfx_file.name} already exists.")
+        if dry_run:
+            print("  [DRY-RUN] A real run would prompt before overwriting it.")
+        elif not ask_yes_no("  Overwrite?", default=False):
+            print("  Skipping.")
+            return
+
+    if dry_run:
+        print(f"\n  [DRY-RUN] Would create:")
+        print(f"    {pfx_file.name}  (key + {leaf_file.name}"
+              f"{' + ' + ' + '.join(f.name for f in chain_files) if chain_files else ''})")
+        audit_log({
+            "Path"    : str(cert_path),
+            "CN"      : cn,
+            "Type"    : "PFX EXPORT",
+            "Cert"    : leaf_file.name,
+            "Chain"   : ", ".join(f.name for f in chain_files) if chain_files else "none",
+            "Status"  : "DRY-RUN — no files written",
+        }, dry_run=True)
+        return
+
+    # Validate every PEM input before touching openssl, so a half-pasted file
+    # produces a clear message rather than an opaque openssl error.
+    read_pem_certs(leaf_file)
+    chain_pem = "".join(read_pem_certs(f) for f in chain_files)
+
+    password = key_password_for(cert_path, cn)
+    # Key password doubles as the PFX export password; both travel by env var.
+    env = {**os.environ, "OPENSSL_PASS": password}
+
+    print("\n  Verifying key and certificate match...")
+    assert_key_matches_cert(key_file, leaf_file, env)
+    print("    OK — certificate matches the private key.")
+
+    args = [
+        "-out", str(pfx_file),
+        "-inkey", str(key_file),
+        "-in", str(leaf_file),
+        "-passin", "env:OPENSSL_PASS",
+        "-passout", "env:OPENSSL_PASS",
+    ]
+
+    chain_tmp: Path | None = None
+    if chain_pem:
+        fd, tmp_name = tempfile.mkstemp(prefix="certchain_", suffix=".pem", text=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(chain_pem)
+        chain_tmp = Path(tmp_name)
+        args += ["-certfile", str(chain_tmp)]
+
+    print("  Exporting PFX...")
+    try:
+        used_legacy = run_pkcs12_export(args, env=env)
+    finally:
+        if chain_tmp:
+            chain_tmp.unlink(missing_ok=True)
+
+    # Read the PFX back so a corrupt or empty export cannot pass silently
+    verify = run_openssl(
+        ["pkcs12", "-info", "-in", str(pfx_file), "-passin", "env:OPENSSL_PASS", "-nokeys"]
+        + (["-legacy"] if used_legacy else []),
+        env=env, capture=True,
+    )
+    subjects = [
+        l.strip() for l in (verify.stdout + verify.stderr).splitlines()
+        if l.strip().startswith("subject=")
+    ]
+    print(f"\n  [PFX Verification]  {pfx_file.name}")
+    for subj in subjects:
+        print(f"    {subj}")
+    if not subjects:
+        raise RuntimeError(f"{pfx_file.name} was written but contains no certificates.")
+
+    audit_log({
+        "Path"    : str(cert_path),
+        "CN"      : cn,
+        "Type"    : "PFX EXPORT",
+        "Cert"    : leaf_file.name,
+        "Chain"   : ", ".join(f.name for f in chain_files) if chain_files else "none",
+        "Certs"   : str(len(subjects)),
+        "Files"   : pfx_file.name,
+    })
+
+    print(f"\n{'=' * 60}")
+    print(f"  PFX READY — {pfx_file.name}")
+    print(f"  Import password: same as the certificate password")
+    print(f"{'=' * 60}")
+
+
 # ── Input file parsing ─────────────────────────────────────────────────────────
 
 def read_input_file(input_path: str) -> list[str]:
@@ -445,6 +648,7 @@ def main() -> None:
             "  python gen_cert.py --paths /certs/app1 /certs/app2 --keysize 4096 --autopass\n"
             "  python gen_cert.py --input batch.txt --keysize 4096 --autopass\n"
             "  python gen_cert.py --paths /certs/app1 --dry-run\n"
+            "  python gen_cert.py --paths /certs/app1 --pfx\n"
         ),
     )
     parser.add_argument("--paths", nargs="+", metavar="DIR",
@@ -455,6 +659,12 @@ def main() -> None:
                         help="RSA key size to apply to all certs")
     parser.add_argument("--autopass", action="store_true",
                         help="Auto-generate a unique secure password for each cert")
+    parser.add_argument("--pfx", action="store_true",
+                        help="Export {CN}.pfx from the populated cert files (run after pasting "
+                             "the ServiceNow response); does not generate keys or CSRs")
+    parser.add_argument("--no-chain", action="store_false", dest="chain",
+                        help="With --pfx, export the leaf certificate only, omitting the "
+                             "root and intermediate from the PFX")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite existing files without prompting")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run",
@@ -464,9 +674,14 @@ def main() -> None:
     if args.paths and args.input:
         sys.exit("[ERROR] --paths and --input are mutually exclusive. Use one or the other.")
 
+    if not args.chain and not args.pfx:
+        sys.exit("[ERROR] --no-chain only applies to --pfx.")
+
     check_openssl()
 
     print("\n=== Enterprise Certificate Generation Tool ===")
+    if args.pfx:
+        print("    *** PFX EXPORT MODE — no keys or CSRs will be generated ***")
     if args.dry_run:
         print("    *** DRY-RUN MODE — no files will be written ***")
     print()
@@ -499,6 +714,23 @@ def main() -> None:
         f"Continue with the {len(valid)} valid path(s)?"
     ):
         sys.exit(0)
+
+    # ── PFX export mode: nothing below this applies ──
+    if args.pfx:
+        for cert_path in valid:
+            try:
+                export_pfx(
+                    cert_path=cert_path,
+                    force=args.force,
+                    dry_run=args.dry_run,
+                    include_chain=args.chain,
+                )
+            except Exception as exc:
+                print(f"\n  [ERROR] Failed exporting PFX for {cert_path}: {exc}")
+                if not ask_yes_no("  Continue with remaining paths?"):
+                    sys.exit(1)
+        print("\n=== Complete ===\n")
+        return
 
     # ── Shared settings for multi-cert batches ──
     shared_key_size: int | None = args.keysize
