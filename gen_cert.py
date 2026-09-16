@@ -491,7 +491,7 @@ def run_pkcs12_export(args: list[str], env: dict) -> bool:
         return False
 
 
-def export_pfx(cert_path: Path, force: bool, dry_run: bool, include_chain: bool) -> None:
+def export_pfx(cert_path: Path, force: bool, dry_run: bool) -> None:
     cnf = cert_path / "openssl.cnf"
     cn = parse_cn(cnf)
 
@@ -513,24 +513,9 @@ def export_pfx(cert_path: Path, force: bool, dry_run: bool, include_chain: bool)
             "Paste the certificate from the ServiceNow response before exporting."
         )
 
-    root_file  = find_cert_file(cert_path, f"{cn}-root")
-    inter_file = find_cert_file(cert_path, f"{cn}-intermediate")
-
+    # The PFX carries the leaf certificate only. The -root and -intermediate
+    # files are still generated and populated, but are deliberately not bundled.
     print(f"  Certificate : {leaf_file.name}")
-    chain_files: list[Path] = []
-    if include_chain:
-        # Intermediate first, then root — the order Windows expects to walk.
-        chain_files = [f for f in (inter_file, root_file) if f is not None]
-        for f in chain_files:
-            print(f"  Chain       : {f.name}")
-        missing = [
-            label for label, f in (("intermediate", inter_file), ("root", root_file)) if f is None
-        ]
-        if missing:
-            print(f"  [WARNING] No {' or '.join(missing)} certificate found — "
-                  "the PFX will not carry a complete chain.")
-    else:
-        print("  Chain       : skipped (--no-chain)")
 
     if pfx_file.exists() and not force:
         print(f"\n  [WARNING] {pfx_file.name} already exists.")
@@ -542,14 +527,12 @@ def export_pfx(cert_path: Path, force: bool, dry_run: bool, include_chain: bool)
 
     if dry_run:
         print(f"\n  [DRY-RUN] Would create:")
-        print(f"    {pfx_file.name}  (key + {leaf_file.name}"
-              f"{' + ' + ' + '.join(f.name for f in chain_files) if chain_files else ''})")
+        print(f"    {pfx_file.name}  (key + {leaf_file.name})")
         audit_log({
             "Path"    : str(cert_path),
             "CN"      : cn,
             "Type"    : "PFX EXPORT",
             "Cert"    : leaf_file.name,
-            "Chain"   : ", ".join(f.name for f in chain_files) if chain_files else "none",
             "Status"  : "DRY-RUN — no files written",
         }, dry_run=True)
         return
@@ -557,7 +540,6 @@ def export_pfx(cert_path: Path, force: bool, dry_run: bool, include_chain: bool)
     # Validate every PEM input before touching openssl, so a half-pasted file
     # produces a clear message rather than an opaque openssl error.
     read_pem_certs(leaf_file)
-    chain_pem = "".join(read_pem_certs(f) for f in chain_files)
 
     password = key_password_for(cert_path, cn)
     # Key password doubles as the PFX export password; both travel by env var.
@@ -575,20 +557,8 @@ def export_pfx(cert_path: Path, force: bool, dry_run: bool, include_chain: bool)
         "-passout", "env:OPENSSL_PASS",
     ]
 
-    chain_tmp: Path | None = None
-    if chain_pem:
-        fd, tmp_name = tempfile.mkstemp(prefix="certchain_", suffix=".pem", text=True)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(chain_pem)
-        chain_tmp = Path(tmp_name)
-        args += ["-certfile", str(chain_tmp)]
-
     print("  Exporting PFX...")
-    try:
-        used_legacy = run_pkcs12_export(args, env=env)
-    finally:
-        if chain_tmp:
-            chain_tmp.unlink(missing_ok=True)
+    used_legacy = run_pkcs12_export(args, env=env)
 
     # Read the PFX back so a corrupt or empty export cannot pass silently
     verify = run_openssl(
@@ -611,7 +581,6 @@ def export_pfx(cert_path: Path, force: bool, dry_run: bool, include_chain: bool)
         "CN"      : cn,
         "Type"    : "PFX EXPORT",
         "Cert"    : leaf_file.name,
-        "Chain"   : ", ".join(f.name for f in chain_files) if chain_files else "none",
         "Certs"   : str(len(subjects)),
         "Files"   : pfx_file.name,
     })
@@ -662,9 +631,6 @@ def main() -> None:
     parser.add_argument("--pfx", action="store_true",
                         help="Export {CN}.pfx from the populated cert files (run after pasting "
                              "the ServiceNow response); does not generate keys or CSRs")
-    parser.add_argument("--no-chain", action="store_false", dest="chain",
-                        help="With --pfx, export the leaf certificate only, omitting the "
-                             "root and intermediate from the PFX")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite existing files without prompting")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run",
@@ -673,9 +639,6 @@ def main() -> None:
 
     if args.paths and args.input:
         sys.exit("[ERROR] --paths and --input are mutually exclusive. Use one or the other.")
-
-    if not args.chain and not args.pfx:
-        sys.exit("[ERROR] --no-chain only applies to --pfx.")
 
     check_openssl()
 
@@ -723,7 +686,6 @@ def main() -> None:
                     cert_path=cert_path,
                     force=args.force,
                     dry_run=args.dry_run,
-                    include_chain=args.chain,
                 )
             except Exception as exc:
                 print(f"\n  [ERROR] Failed exporting PFX for {cert_path}: {exc}")

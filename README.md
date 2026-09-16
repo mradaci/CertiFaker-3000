@@ -89,7 +89,6 @@ python gen_cert.py --paths "C:\certs\AppServer01" "C:\certs\WebGateway" --keysiz
 | `--keysize {2048,4096}` | RSA key size — applies to all certs in the run (default: 2048) |
 | `--autopass` | Auto-generate a unique secure password for each cert |
 | `--pfx` | Export `{CN}.pfx` from the populated cert files (second stage — see below) |
-| `--no-chain` | With `--pfx`, export the leaf certificate only |
 | `--force` | Overwrite existing files without prompting |
 | `--dry-run` | Preview all actions without writing any files |
 
@@ -210,8 +209,6 @@ python gen_cert.py --paths C:\certs\AppServer01 --pfx
   CN        : appserver01.corp.example.com
 
   Certificate : appserver01.corp.example.com.crt
-  Chain       : appserver01.corp.example.com-intermediate.crt
-  Chain       : appserver01.corp.example.com-root.crt
   Password read from appserver01.corp.example.com.password.txt
 
   Verifying key and certificate match...
@@ -220,8 +217,6 @@ python gen_cert.py --paths C:\certs\AppServer01 --pfx
 
   [PFX Verification]  appserver01.corp.example.com.pfx
     subject=C=US, ST=New York, O=Acme Corporation, CN=appserver01.corp.example.com
-    subject=C=US, O=Acme Corporation, CN=Acme Issuing CA
-    subject=C=US, O=Acme Corporation, CN=Acme Root CA
 
   ============================================================
   PFX READY — appserver01.corp.example.com.pfx
@@ -241,10 +236,14 @@ python gen_cert.py --input batch.txt --pfx
 
 ### Chain handling
 
-The root and intermediate are bundled into the PFX via `-certfile`, so IIS
-presents the full chain to clients. If either file is empty the export still
-succeeds and warns that the chain is incomplete. Pass `--no-chain` to export the
-leaf certificate alone.
+**The PFX contains the leaf certificate and private key only.** The root and
+intermediate are not bundled into it — the target Windows servers are expected
+to already trust the issuing chain.
+
+`{CN}-root.crt` and `{CN}-intermediate.crt` are still generated and still meant
+to be populated from the ServiceNow response. They are retained as the record of
+the issuing chain, and so that bundling them becomes a small change if that
+requirement comes up later.
 
 ### Checks performed before export
 
@@ -252,7 +251,7 @@ leaf certificate alone.
 |---|---|
 | `{CN}.key` exists | Export aborts |
 | `{CN}.crt` exists and is non-empty | Aborts, telling you to paste the cert |
-| Each file contains a `BEGIN CERTIFICATE` block | Aborts, naming the file |
+| `{CN}.crt` contains a `BEGIN CERTIFICATE` block | Aborts, naming the file |
 | Certificate and private key are a matching pair | Aborts — catches a cert pasted into the wrong directory |
 | Written PFX reads back with at least one certificate | Aborts |
 
