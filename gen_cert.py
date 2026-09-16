@@ -640,6 +640,22 @@ def main() -> None:
     if args.paths and args.input:
         sys.exit("[ERROR] --paths and --input are mutually exclusive. Use one or the other.")
 
+    # --pfx reads an existing key; it never generates one. Reject the
+    # generation-only flags rather than ignoring them, so nothing reads as
+    # having regenerated a key that was in fact left untouched.
+    if args.pfx:
+        conflicting = [
+            flag for flag, given in (("--keysize", args.keysize), ("--autopass", args.autopass))
+            if given
+        ]
+        if conflicting:
+            verb = "does not" if len(conflicting) == 1 else "do not"
+            noun = "the flag" if len(conflicting) == 1 else "those flags"
+            sys.exit(
+                f"[ERROR] {' and '.join(conflicting)} {verb} apply to --pfx — it exports an "
+                f"existing key and certificate. Drop {noun}, or omit --pfx to generate a new key."
+            )
+
     check_openssl()
 
     print("\n=== Enterprise Certificate Generation Tool ===")

@@ -234,6 +234,18 @@ python gen_cert.py --input batch.txt --pfx
 **The PFX import password is the certificate password** — read from
 `{CN}.password.txt` when it exists, otherwise prompted for. No second secret.
 
+The two stages are mutually exclusive. A stage-1 run never produces a `.pfx`,
+and `--pfx` never generates a key or CSR — it only reads what is already on
+disk, so any amount of time can pass between the two. `--keysize` and
+`--autopass` are generation-only and are rejected with `--pfx` rather than
+silently ignored:
+
+```
+$ python gen_cert.py --paths C:\certs\AppServer01 --pfx --keysize 4096
+[ERROR] --keysize does not apply to --pfx — it exports an existing key and
+certificate. Drop the flag, or omit --pfx to generate a new key.
+```
+
 ### Chain handling
 
 **The PFX contains the leaf certificate and private key only.** The root and
