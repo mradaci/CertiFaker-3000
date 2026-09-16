@@ -22,7 +22,7 @@ Place `gen_cert.py` in a shared/central location. It does not need to live along
 
 ## How It Works
 
-Each certificate lives in its own directory containing an `openssl.cnf`. The script reads the `commonName_default` field from that file to derive the CN, which drives all output file naming. No manual filename input is required.
+Each certificate lives in its own directory containing an `openssl.cnf`. The script reads the common name from that file to derive the CN, which drives all output file naming. No manual filename input is required.
 
 **Output files generated per cert:**
 
@@ -243,7 +243,7 @@ Each cert directory must contain an `openssl.cnf` with at minimum:
 
 ```ini
 [ req_distinguished_name ]
-commonName_default = appserver01.corp.example.com
+commonName = appserver01.corp.example.com
 
 [ v3_req ]
 subjectAltName = @alt_names
@@ -252,4 +252,29 @@ subjectAltName = @alt_names
 DNS.1 = appserver01.corp.example.com
 ```
 
-The `commonName_default` value drives all output file naming for that cert.
+The common name drives all output file naming for that cert.
+
+### Both CNF styles are supported
+
+| Style | Looks like | CN source |
+|---|---|---|
+| Direct | `commonName = host.example.com` | the `commonName` value |
+| Prompt | `commonName = Common Name (eg, your server's hostname)`<br>`commonName_default = host.example.com` | the `commonName_default` value |
+
+In prompt style the `commonName` value is the label OpenSSL displays to an
+operator, not a hostname — so when a `commonName_default` is present it takes
+precedence. `CN` / `CN_default` are accepted as aliases.
+
+### Why direct-style CNFs used to produce a blank CN
+
+`openssl req -batch` fills each DN field from that field's `_default` entry. A
+direct-style CNF has no `commonName_default`, so OpenSSL treats the `commonName`
+line as a prompt label, finds no default, and drops CN from the subject
+entirely — while country, state, locality, org and OU all still land, because
+those fields do have `_default` entries. The resulting CSR parses fine but shows
+a blank CN in intake forms.
+
+The script now normalises a direct-style CNF into a temporary prompt-style copy
+before invoking OpenSSL, so the CN is always emitted. Your `openssl.cnf` is
+never modified. After generation the CSR's actual subject is re-read and the run
+fails if the CN is missing or does not match the CNF.

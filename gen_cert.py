@@ -14,6 +14,7 @@ import shutil
 import string
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -89,16 +90,77 @@ def run_openssl(args: list[str], env: dict, capture: bool = False) -> subprocess
 
 # ── CNF parsing ────────────────────────────────────────────────────────────────
 
+CN_LINE_RE      = re.compile(r"^([ \t]*(?:CN|commonName)[ \t]*=[ \t]*)(.+?)[ \t]*$", re.MULTILINE | re.IGNORECASE)
+CN_DEFAULT_RE   = re.compile(r"^[ \t]*(?:CN|commonName)_default[ \t]*=[ \t]*(.+?)[ \t]*$", re.MULTILINE | re.IGNORECASE)
+
+
 def parse_cn(cnf_path: Path) -> str:
+    """Read the CN from a cert directory's openssl.cnf.
+
+    Two CNF styles are in circulation:
+
+      prompt style  commonName         = Common Name (eg, your server's hostname)
+                    commonName_default = host.example.com
+
+      direct style  commonName         = host.example.com
+
+    In prompt style the `commonName` value is the *label* openssl shows the
+    operator, not the hostname — so when a `commonName_default` is present it
+    wins. Otherwise the `commonName` value is the hostname itself.
+    """
     content = cnf_path.read_text(encoding="utf-8", errors="replace")
-    for pattern in (
-        r"^\s*commonName_default\s*=\s*(.+)$",
-        r"^\s*CN_default\s*=\s*(.+)$",
-    ):
-        m = re.search(pattern, content, re.MULTILINE | re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    raise ValueError(f"Could not locate commonName_default in {cnf_path}")
+
+    m = CN_DEFAULT_RE.search(content)
+    if m:
+        return m.group(1).strip()
+
+    m = CN_LINE_RE.search(content)
+    if m:
+        return m.group(2).strip()
+
+    raise ValueError(f"Could not locate commonName in {cnf_path}")
+
+
+def effective_cnf(cnf_path: Path, cn: str) -> tuple[Path, Path | None]:
+    """Return (config_to_use, temp_file_to_clean_up).
+
+    `openssl req -batch` fills each DN field from that field's `_default` entry.
+    A direct-style CNF has no `commonName_default`, so openssl treats the
+    `commonName` line as a prompt label, finds no default, and silently drops CN
+    from the subject — every other field still lands, which is why downstream
+    intake forms show country/org/OU but a blank CN.
+
+    When the CNF already carries a `commonName_default` it is used untouched.
+    Otherwise a normalised copy is written to a temp file with the CN promoted
+    into `commonName_default` so the batch run emits it.
+    """
+    content = cnf_path.read_text(encoding="utf-8", errors="replace")
+    if CN_DEFAULT_RE.search(content):
+        return cnf_path, None
+
+    def _promote(match: re.Match) -> str:
+        prefix = match.group(1)
+        indent = prefix[:len(prefix) - len(prefix.lstrip())]
+        field = prefix.strip().rstrip("=").strip()  # preserve CN vs commonName spelling
+        return (
+            f"{indent}{field} = Common Name (eg, your server's hostname)\n"
+            f"{indent}{field}_default = {cn}"
+        )
+
+    patched, count = CN_LINE_RE.subn(_promote, content, count=1)
+    if not count:
+        raise ValueError(f"Could not locate commonName in {cnf_path}")
+
+    fd, tmp_name = tempfile.mkstemp(prefix="opensslcnf_", suffix=".cnf", text=True)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(patched)
+    return Path(tmp_name), Path(tmp_name)
+
+
+def csr_subject_cn(csr_text: str) -> str | None:
+    """Pull the CN out of `openssl req -text` output, if present."""
+    m = re.search(r"^\s*Subject:.*?\bCN\s*=\s*([^,/\n]+)", csr_text, re.MULTILINE)
+    return m.group(1).strip() if m else None
 
 
 # ── Path validation ────────────────────────────────────────────────────────────
@@ -245,13 +307,16 @@ def process_cert(
     if cert_type == "RENEWAL":
         backup_dir = archive_for_renewal(cert_path, cn, dry_run)
     else:
-        # New cert: warn if output files already exist
+        # New cert: warn if output files already exist. A dry run only reports
+        # them — there is nothing to overwrite, so it must not prompt or skip.
         existing = [f for f in output_files if f.exists()]
         if existing and not force:
             print(f"\n  [WARNING] These files already exist:")
             for f in existing:
                 print(f"    • {f.name}")
-            if not ask_yes_no("  Overwrite?", default=False):
+            if dry_run:
+                print("  [DRY-RUN] A real run would prompt before overwriting these.")
+            elif not ask_yes_no("  Overwrite?", default=False):
                 print("  Skipping.")
                 return
 
@@ -284,14 +349,20 @@ def process_cert(
         env=env,
     )
 
-    # Generate CSR
+    # Generate CSR. A CNF without commonName_default would otherwise produce a
+    # CSR with an empty CN, so normalise it first.
     print("  Generating CSR...")
-    run_openssl(
-        ["req", "-new", "-batch",
-         "-key", str(key_file), "-passin", "env:OPENSSL_PASS",
-         "-out", str(csr_file), "-config", str(cnf)],
-        env=env,
-    )
+    config, tmp_config = effective_cnf(cnf, cn)
+    try:
+        run_openssl(
+            ["req", "-new", "-batch",
+             "-key", str(key_file), "-passin", "env:OPENSSL_PASS",
+             "-out", str(csr_file), "-config", str(config)],
+            env=env,
+        )
+    finally:
+        if tmp_config:
+            tmp_config.unlink(missing_ok=True)
 
     # Verify CSR and display Subject + SANs for engineer confirmation
     print("\n  [CSR Verification]")
@@ -300,10 +371,21 @@ def process_cert(
         env=env,
         capture=True,
     )
-    for line in (result.stdout + result.stderr).splitlines():
+    csr_dump = result.stdout + result.stderr
+    for line in csr_dump.splitlines():
         stripped = line.strip()
         if any(kw in stripped for kw in ("Subject:", "DNS:", "IP Address:", "Subject Alternative")):
             print(f"    {stripped}")
+
+    # Fail loudly rather than handing the cert team a CSR with a blank CN
+    csr_cn = csr_subject_cn(csr_dump)
+    if csr_cn is None:
+        raise RuntimeError(
+            f"CSR subject has no CN — {cnf} did not yield a common name. "
+            "Check the commonName entry in that file."
+        )
+    if csr_cn != cn:
+        raise RuntimeError(f"CSR CN '{csr_cn}' does not match the CN from {cnf} ('{cn}').")
 
     # Save auto-generated password to file
     if was_auto:
